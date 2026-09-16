@@ -61,6 +61,14 @@ npm test
 
 Starter tests fail until required schema and handler are implemented. This is expected.
 
+## Design Decisions
+
+- Database uniqueness on `(tenant_id, operation, key)` is the authority that serializes competing requests, including requests handled by different application instances.
+- Request hashes use JSON with object properties recursively sorted; array order and values remain significant, so equivalent object property ordering compares equal without changing request meaning.
+- A key is valid for 24 hours from its claim. After expiry, the same scoped key may be claimed again as a new operation; expiry is retention and reuse policy, not a guarantee that old response data is erased at exactly 24 hours.
+- The paging job is inserted in the same transaction as the incident and completed idempotency record, so a committed incident always has durable work to page and a rollback leaves no partial local effect. External queue/provider calls must happen after commit.
+- Stored response bodies and headers can contain sensitive data and can grow without bound. Production implementations should minimize/redact them, enforce request and response size limits, and apply suitable retention and access controls.
+
 ## What to Implement
 
 ### Database
