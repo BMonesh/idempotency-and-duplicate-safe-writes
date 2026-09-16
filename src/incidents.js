@@ -2,6 +2,12 @@ const crypto = require('crypto');
 const { db } = require('./db');
 const OPERATION = 'POST:/incidents';
 const KEY_TTL_HOURS = 24;
+const ERRORS = {
+  keyRequired: { error: 'idempotency_key_required', message: 'Idempotency-Key header is required.' },
+  keyConflict: { error: 'idempotency_key_conflict', message: 'This idempotency key was already used with a different request.' },
+  inProgress: { error: 'operation_in_progress', message: 'The operation for this idempotency key is still processing.' },
+  priorFailed: { error: 'prior_operation_failed', message: 'The previous operation failed; use a new idempotency key to retry.' }
+};
 
 function canonicalize(value) {
   if (Array.isArray(value)) return value.map(canonicalize);
@@ -20,7 +26,7 @@ function hashRequest(body) {
 
 async function createIncident(req, res) {
   const key = req.get('Idempotency-Key');
-  if (!key || !key.trim()) return res.status(400).json({ error: 'idempotency_key_required' });
+  if (!key || !key.trim()) return res.status(400).json(ERRORS.keyRequired);
 
   const tenantId = req.user.tenantId;
   const requestHash = hashRequest(req.body);
@@ -28,9 +34,9 @@ async function createIncident(req, res) {
   let result;
   try {
     result = await db.tx(async t => {
-    // The unique constraint serializes claims across all application instances.
-    // A conflicting insert waits for the first transaction before this row is read.
-    const claimed = await t.oneOrNone(
+      // The unique constraint serializes claims across all application instances.
+      // A conflicting insert waits for the first transaction before this row is read.
+      const claimed = await t.oneOrNone(
       `INSERT INTO idempotency_keys
          (tenant_id, operation, key, request_hash, state, expires_at)
       VALUES ($1, $2, $3, $4, 'processing', now() + ($5 * interval '1 hour'))
@@ -45,57 +51,57 @@ async function createIncident(req, res) {
          WHERE idempotency_keys.expires_at <= now()
        RETURNING *`,
       [tenantId, OPERATION, key, requestHash, KEY_TTL_HOURS]
-    );
+      );
 
-    const record = claimed || await t.one(
-      `SELECT * FROM idempotency_keys
-       WHERE tenant_id = $1 AND operation = $2 AND key = $3
-       FOR UPDATE`,
-      [tenantId, OPERATION, key]
-    );
+      const record = claimed || await t.one(
+        `SELECT * FROM idempotency_keys
+         WHERE tenant_id = $1 AND operation = $2 AND key = $3
+         FOR UPDATE`,
+        [tenantId, OPERATION, key]
+      );
 
-    if (!claimed) {
-      if (record.request_hash !== requestHash) {
-        return { status: 409, body: { error: 'idempotency_key_conflict' } };
-      }
-      if (record.state === 'completed') {
-        if (!record.status_code || record.response_body === null) {
-          throw new Error('completed idempotency record is missing replay metadata');
+      if (!claimed) {
+        if (record.request_hash !== requestHash) {
+          return { status: 409, body: ERRORS.keyConflict };
         }
-        return {
-          status: record.status_code,
-          body: record.response_body,
-          headers: record.response_headers,
-          replayed: true
-        };
+        if (record.state === 'completed') {
+          if (!record.status_code || record.response_body === null) {
+            throw new Error('completed idempotency record is missing replay metadata');
+          }
+          return {
+            status: record.status_code,
+            body: record.response_body,
+            headers: record.response_headers,
+            replayed: true
+          };
+        }
+        if (record.state === 'processing') {
+          return { status: 409, body: ERRORS.inProgress };
+        }
+        return { status: 409, body: ERRORS.priorFailed };
       }
-      if (record.state === 'processing') {
-        return { status: 409, body: { error: 'operation_in_progress' } };
-      }
-      return { status: 409, body: { error: 'prior_operation_failed' } };
-    }
 
-    const incident = await t.one(
-      `INSERT INTO incidents (tenant_id, service_id, title, severity)
-       VALUES ($1, $2, $3, $4)
-       RETURNING *`,
-      [tenantId, req.body.serviceId, req.body.title, req.body.severity]
-    );
-    await t.none(
-      `INSERT INTO paging_jobs (tenant_id, incident_id) VALUES ($1, $2)`,
-      [tenantId, incident.id]
-    );
-    // This is deliberately the final write: any earlier failure rolls back the
-    // claim, incident, and paging job together instead of leaving stale state.
-    await t.one(
-      `UPDATE idempotency_keys
-       SET state = 'completed', status_code = 201,
-           response_headers = $2::jsonb, response_body = $3::jsonb, updated_at = now()
-       WHERE id = $1 AND state = 'processing'
-       RETURNING id`,
-      [record.id, JSON.stringify({}), JSON.stringify(incident)]
-    );
-    return { status: 201, body: incident };
+      const incident = await t.one(
+        `INSERT INTO incidents (tenant_id, service_id, title, severity)
+         VALUES ($1, $2, $3, $4)
+         RETURNING *`,
+        [tenantId, req.body.serviceId, req.body.title, req.body.severity]
+      );
+      await t.none(
+        `INSERT INTO paging_jobs (tenant_id, incident_id) VALUES ($1, $2)`,
+        [tenantId, incident.id]
+      );
+      // This is deliberately the final write: any earlier failure rolls back the
+      // claim, incident, and paging job together instead of leaving stale state.
+      await t.one(
+        `UPDATE idempotency_keys
+         SET state = 'completed', status_code = 201,
+             response_headers = $2::jsonb, response_body = $3::jsonb, updated_at = now()
+         WHERE id = $1 AND state = 'processing'
+         RETURNING id`,
+        [record.id, JSON.stringify({}), JSON.stringify(incident)]
+      );
+      return { status: 201, body: incident };
     });
   } catch (error) {
     // The successful path remains atomic. If it aborts, preserve the key's

@@ -77,7 +77,7 @@ Idempotency records are scoped to the authenticated tenant, operation, and key. 
 - `completed`: return the stored status, response body, and replay metadata, including `Idempotent-Replayed: true`.
 - `failed`: return `409 prior_operation_failed`; recovery is explicit rather than silently repeating an operation whose outcome is known to have failed.
 
-A request with the same key but a different canonical hash always returns `409 idempotency_key_conflict` while the record is unexpired. Once the 24-hour expiry has passed, the scoped key may be claimed as a new operation and receives a new request hash and processing state.
+A request with the same key but a different canonical hash always returns `409 idempotency_key_conflict` with a message explaining that the key is bound to another request while the record is unexpired. Once the 24-hour expiry has passed, the scoped key may be claimed as a new operation and receives a new request hash and processing state. Error responses keep stable machine-readable `error` codes and include concise `message` text for operators and clients.
 
 ## What to Implement
 
