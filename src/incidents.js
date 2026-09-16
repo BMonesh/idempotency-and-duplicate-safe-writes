@@ -25,7 +25,9 @@ async function createIncident(req, res) {
   const tenantId = req.user.tenantId;
   const requestHash = hashRequest(req.body);
 
-  const result = await db.tx(async t => {
+  let result;
+  try {
+    result = await db.tx(async t => {
     // The unique constraint serializes claims across all application instances.
     // A conflicting insert waits for the first transaction before this row is read.
     const claimed = await t.oneOrNone(
@@ -94,7 +96,25 @@ async function createIncident(req, res) {
       [record.id, JSON.stringify({}), JSON.stringify(incident)]
     );
     return { status: 201, body: incident };
-  });
+    });
+  } catch (error) {
+    // The successful path remains atomic. If it aborts, preserve the key's
+    // failure state in a separate transaction so a retry cannot repeat it.
+    try {
+      await db.none(
+        `INSERT INTO idempotency_keys
+           (tenant_id, operation, key, request_hash, state, expires_at)
+         VALUES ($1, $2, $3, $4, 'failed', now() + ($5 * interval '1 hour'))
+         ON CONFLICT (tenant_id, operation, key) DO UPDATE
+           SET state = 'failed', updated_at = now()
+           WHERE idempotency_keys.state = 'processing'`,
+        [tenantId, OPERATION, key, requestHash, KEY_TTL_HOURS]
+      );
+    } catch (failureRecordError) {
+      // Keep the original database error as the HTTP 500 cause.
+    }
+    throw error;
+  }
 
   if (result.replayed) res.set('Idempotent-Replayed', 'true');
   return res.status(result.status).json(result.body);
