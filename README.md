@@ -69,6 +69,16 @@ Starter tests fail until required schema and handler are implemented. This is ex
 - The paging job is inserted in the same transaction as the incident and completed idempotency record, so a committed incident always has durable work to page and a rollback leaves no partial local effect. External queue/provider calls must happen after commit.
 - Stored response bodies and headers can contain sensitive data and can grow without bound. Production implementations should minimize/redact them, enforce request and response size limits, and apply suitable retention and access controls.
 
+### Replay Policy
+
+Idempotency records are scoped to the authenticated tenant, operation, and key. A request with the same scope and canonical request hash follows the stored state:
+
+- `processing`: return `409 operation_in_progress`; the retry does not create another incident or paging job.
+- `completed`: return the stored status, response body, and replay metadata, including `Idempotent-Replayed: true`.
+- `failed`: return `409 prior_operation_failed`; recovery is explicit rather than silently repeating an operation whose outcome is known to have failed.
+
+A request with the same key but a different canonical hash always returns `409 idempotency_key_conflict` while the record is unexpired. Once the 24-hour expiry has passed, the scoped key may be claimed as a new operation and receives a new request hash and processing state.
+
 ## What to Implement
 
 ### Database
